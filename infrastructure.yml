@@ -1,0 +1,814 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: The template creates an ephemeral infrastructure, a default user and a temporary password. 
+  It assumes you have a keypair, and an EFS file system.
+  Things that you can change in the template are written in comments.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+    Default: Customer
+
+  ECRRepoParam:
+    Type: String
+    Description: Choose a name for the ECR repository. (must be lowercase)
+    Default: customer-repository
+  
+  ClusterSize:
+    Description: How many ECS hosts do you want to initially deploy?
+    Type: Number
+    Default: 1
+
+  ClusterMaxSize:
+    Description: What is the maximum ASG scaling?
+    Type: Number
+    Default: 2
+
+  ECSAMI:
+    Description: ECS-Optimized AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+  Subnets:
+    Description: Choose which subnets the ECS autoscaling group will launch instances in
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: <Enter a default subnet ID> #change the subnet id
+
+  EFSFileSystem:
+    Description: Enter your EFS filesystem id that will be attached to the task definition of the container
+    Type: String
+
+  VPCID:
+    Description: Enter the VPC ID that the security group of the ECS instance will reside in
+    Type: AWS::EC2::VPC::Id
+
+  TempPassword:
+    Description: The temporary password for the IAM user
+    Type: String
+  
+  AMISize:
+    Description: The size of the EC2 instance that will be attached to the ECS cluster
+    Type: String  
+    Default: t2.micro
+
+  EC2KeyPair:
+    Description: The keypair that will be attached to the instance upon creation
+    Type: AWS::EC2::KeyPair::KeyName
+
+  DesiredTasks:
+    Description: The desired tasks for the service. If this is the first time the template is being deployed, keep at 0 and change it manually.
+    Type: Number
+    Default: 0
+
+  IAMUserName: 
+    Description: The name of the IAM user to create
+    Type: String 
+
+Resources:
+  ECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      RepositoryName: !Ref ECRRepoParam
+  
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EnvironmentName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+  
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Image: !GetAtt ECRRepo.RepositoryUri
+          Name: CustomerContainer
+          Memory: 512
+          MountPoints:
+            - SourceVolume: logs
+              ContainerPath: /logs
+      Volumes:
+        - Name: logs
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EFSFileSystem
+            RootDirectory: /
+            TransitEncryption: ENABLED
+  
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub ${EnvironmentName}-ECSRole-${AWS::Region}
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Action": "sts:AssumeRole",
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                }
+            }]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument: |
+            {
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecs:CreateCluster",
+                        "ecs:DeregisterContainerInstance",
+                        "ecs:DiscoverPollEndpoint",
+                        "ecs:Poll",
+                        "ecs:RegisterContainerInstance",
+                        "ecs:StartTelemetrySession",
+                        "ecs:Submit*",
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:BatchGetImage",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:GetAuthorizationToken"
+                    ],
+                    "Resource": "*"
+                }]
+            }
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: ECSInstanceProfile
+      Path: "/"
+      Roles:
+        - !Ref ECSRole
+  
+  ECSServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Action:
+            - "sts:AssumeRole"
+          Effect: Allow
+          Principal:
+            Service:
+              - application-autoscaling.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: ecs-service-autoscaling
+          PolicyDocument:
+            Statement:
+              Effect: Allow
+              Action:
+                - application-autoscaling:*
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:PutMetricAlarm
+                - ecs:DescribeServices
+                - ecs:UpdateService
+              Resource: "*"
+
+  ECSCloudWatchParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: ECS
+      Name: !Sub "AmazonCloudWatch-${ECSCluster}-ECS"
+      Type: String
+      Value: !Sub |
+        {
+          "logs": {
+            "force_flush_interval": 5,
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "${ECSCluster}-/var/log/messages",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%b %d %H:%M:%S"
+                  },
+                  {
+                    "file_path": "/var/log/dmesg",
+                    "log_group_name": "${ECSCluster}-/var/log/dmesg",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/log/docker",
+                    "log_group_name": "${ECSCluster}-/var/log/docker",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%S.%f"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-init.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-init.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-agent.log.*",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-agent.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/audit.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/audit.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "append_dimensions": {
+              "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+              "InstanceId": "${!aws:InstanceId}",
+              "InstanceType": "${!aws:InstanceType}"
+            },
+            "metrics_collected": {
+              "collectd": {
+                "metrics_aggregation_interval": 60
+              },
+              "disk": {
+                "measurement": [
+                  "used_percent"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                  "/"
+                ]
+              },
+              "mem": {
+                "measurement": [
+                  "mem_used_percent"
+                ],
+                "metrics_collection_interval": 60
+              },
+              "statsd": {
+                "metrics_aggregation_interval": 60,
+                "metrics_collection_interval": 10,
+                "service_address": ":8125"
+              }
+            }
+          }
+        }
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows SSH to the instance.
+      GroupName: ECSSecurityGroup
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0 #change the ip to your organization ip
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+
+  ECSLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: Customer-launch-template
+      LaunchTemplateData: 
+          CreditSpecification: 
+            CpuCredits: Unlimited
+          ImageId: !Ref ECSAMI
+          InstanceType: !Ref AMISize
+          IamInstanceProfile:
+            Arn: !GetAtt ECSInstanceProfile.Arn
+          UserData:
+            "Fn::Base64": !Sub |
+              #!/bin/bash
+              yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+              yum install -y https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+              yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+              yum install -y aws-cfn-bootstrap hibagent
+              yum install -y ec2-instance-connect 
+              /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchTemplate
+              /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup
+              /usr/bin/enable-ec2-spot-hibernation
+          KeyName: !Ref EC2KeyPair
+          SecurityGroupIds:
+            - !Ref ECSSecurityGroup
+
+    Metadata:
+        AWS::CloudFormation::Init:
+          config:
+            packages:
+              yum:
+                collectd: []
+            commands:
+              01_add_instance_to_cluster:
+                command: !Sub echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+              02_enable_cloudwatch_agent:
+                command: !Sub /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${ECSCloudWatchParameter} -s
+            files:
+              /etc/cfn/cfn-hup.conf:
+                mode: 000400
+                owner: root
+                group: root
+                content: !Sub |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+              /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+                content: !Sub |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.ECSLaunchTemplate.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchTemplate
+            services:
+              sysvinit:
+                cfn-hup:
+                  enabled: true
+                  ensureRunning: true
+                  files:
+                    - /etc/cfn/cfn-hup.conf
+                    - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+  ECSAutoScalingGroup:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref ClusterSize
+      MaxSize: !Ref ClusterMaxSize
+      DesiredCapacity: !Ref ClusterSize
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} ECS host
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+  
+  ECSService: 
+    Type: AWS::ECS::Service
+    Properties: 
+      Cluster: 
+        Ref: "ECSCluster"
+      DesiredCount: 0
+      TaskDefinition: 
+        Ref: "ECSTaskDefinition"
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "codebuild.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+  BuildRolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "AWSCodeBuildServiceRolePolicy"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ECSProject
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ECSProject:*
+          - Effect: "Allow"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+            Resource: !Join [ '', [ !GetAtt CodePipelineArtifactStoreBucket.Arn, '/*' ] ]
+          - Effect: "Allow"
+            Action:
+              - codebuild:CreateReportGroup
+              - codebuild:CreateReport
+              - codebuild:UpdateReport
+              - codebuild:BatchPutTestCases
+              - codebuild:BatchPutCodeCoverages
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/ECSProject-*"
+
+      Roles: 
+        - Ref: "CodeBuildServiceRole"
+  CodeBuildInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+        - Ref: "CodeBuildServiceRole"
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "codepipeline.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+  RolePolicies:
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "AWSCodePipelineServiceRolePolicy"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "iam:PassRole"
+            Resource: "*"
+            Condition:
+              StringEqualsIfExists:
+                iam:PassedToService:
+                  - cloudformation.amazonaws.com
+                  - elasticbeanstalk.amazonaws.com
+                  - ec2.amazonaws.com
+                  - ecs-tasks.amazonaws.com
+          - Effect: "Allow"
+            Action:
+              - codecommit:CancelUploadArchive
+              - codecommit:GetBranch
+              - codecommit:GetCommit
+              - codecommit:GetRepository
+              - codecommit:GetUploadArchiveStatus
+              - codecommit:UploadArchive
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetApplication
+              - codedeploy:GetApplicationRevision
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:RegisterApplicationRevision
+            Resource: "*"
+          - Effect: "Allow"
+            Action: codestar-connections:UseConnection
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - elasticbeanstalk:*
+              - ec2:*
+              - elasticloadbalancing:*
+              - autoscaling:*
+              - cloudwatch:*
+              - s3:*
+              - sns:*
+              - cloudformation:*
+              - rds:*
+              - sqs:*
+              - ecs:*
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - lambda:InvokeFunction
+              - lambda:ListFunctions
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - opsworks:CreateDeployment
+              - opsworks:DescribeApps
+              - opsworks:DescribeCommands
+              - opsworks:DescribeDeployments
+              - opsworks:DescribeInstances
+              - opsworks:DescribeStacks
+              - opsworks:UpdateApp
+              - opsworks:UpdateStack
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:UpdateStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:SetStackPolicy
+              - cloudformation:ValidateTemplate
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuildBatches
+              - codebuild:StartBuildBatch
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - devicefarm:ListProjects
+              - devicefarm:ListDevicePools
+              - devicefarm:GetRun
+              - devicefarm:GetUpload
+              - devicefarm:CreateUpload
+              - devicefarm:ScheduleRun
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - servicecatalog:ListProvisioningArtifacts
+              - servicecatalog:CreateProvisioningArtifact
+              - servicecatalog:DescribeProvisioningArtifact
+              - servicecatalog:DeleteProvisioningArtifact
+              - servicecatalog:UpdateProduct
+            Resource: "*"
+          - Effect: "Allow"
+            Action: cloudformation:ValidateTemplate
+            Resource: "*"
+          - Effect: "Allow"
+            Action: ecr:DescribeImages
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - states:DescribeExecution
+              - states:DescribeStateMachine
+              - states:StartExecution
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - appconfig:StartDeployment
+              - appconfig:StopDeployment
+              - appconfig:GetDeployment
+            Resource: "*"
+      Roles: 
+        - Ref: "CodePipelineServiceRole"
+  CodePipeLineInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+        - Ref: "CodePipelineServiceRole"
+
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ECSCodePipeLine}
+
+  
+  AmazonCloudWatchEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        detail:
+          action-type: [PUSH]
+          image-tag: [latest]
+          repository-name: [!Ref ECRRepo]
+          result: [SUCCESS]
+        detail-type: [ECR Image Action]
+        source: [aws.ecr]
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ECSCodePipeLine}
+          RoleArn: !GetAtt 
+            - AmazonCloudWatchEventRole
+            - Arn
+          Id: codepipeline-AppPipeline
+
+  CodePipelineArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Join [ '', [ !GetAtt CodePipelineArtifactStoreBucket.Arn, '/*' ] ]
+            Condition:
+              StringNotEquals: 
+                s3:x-amz-server-side-encryption: aws:kms
+          -
+            Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: !Join [ '', [ !GetAtt CodePipelineArtifactStoreBucket.Arn, '/*' ] ]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ECSCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ECSProject
+      Description: A build for ECR with ECS integration.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+            build:
+              commands:
+                - apt-get install jq -y
+                - ContainerName="CustomerContainer"
+                - ImageURI=$(cat imageDetail.json | jq -r '.ImageURI')
+                - printf '[{"name":"CONTAINER_NAME","imageUri":"IMAGE_URI"}]' > imagedefinitions.json
+                - sed -i -e "s|CONTAINER_NAME|$ContainerName|g" imagedefinitions.json
+                - sed -i -e "s|IMAGE_URI|$ImageURI|g" imagedefinitions.json
+                - cat imagedefinitions.json
+          artifacts:
+            files:
+                - imagedefinitions.json
+      TimeoutInMinutes: 5
+
+  ECSCodePipeLine:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RestartExecutionOnUpdate: true
+      RoleArn:
+        !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              InputArtifacts: []
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: ECR
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+              Configuration:
+                ImageTag: latest
+                RepositoryName: !Ref ECRRepo
+        - Name: Build
+          Actions:
+            - Name: ECSBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              RunOrder: 2
+              Configuration:
+                BatchEnabled: 'false'
+                CombineArtifacts: 'false'
+                ProjectName: ECSProject
+                PrimarySource: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+        - Name: Deploy
+          Actions:
+            - Name: DeployECS
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              RunOrder: 3
+              Configuration:
+                ClusterName: !Ref ECSCluster
+                ServiceName: !Ref ECSService
+                FileName: imagedefinitions.json
+                DeploymentTimeout: '15'
+              OutputArtifacts: []
+              InputArtifacts:
+                - Name: BuildArtifact
+
+  IAMUser:
+    Type: AWS::IAM::User
+    Properties: 
+      UserName: !Ref IAMUserName
+      LoginProfile:
+        Password: !Ref TempPassword
+        PasswordResetRequired: true
+  
+  IAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: Customer-Policy
+      Users: 
+        - !Ref IAMUser
+      PolicyDocument:
+        Id: CustomerPolicy
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:GetAccountSummary
+              - iam:ListUsers
+              - ecr:GetAuthorizationToken
+              - ecr:DescribeRepositories
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+              - ec2:DescribeTags
+              - ec2:DescribeSnapshots
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ecr:ListImages
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:GetRepositoryPolicy
+              - ecr:ListImages
+              - ecr:DescribeImages
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              - ecr:BatchDeleteImage
+            Resource:
+              - !GetAtt ECRRepo.Arn
+          - Effect: Allow
+            Action:
+              - iam:ChangePassword
+              - iam:GetUser
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:ListAccessKeys
+              - iam:UpdateAccessKey
+              - iam:CreateLoginProfile
+              - iam:DeleteLoginProfile
+              - iam:GetLoginProfile
+              - iam:UpdateLoginProfile
+            Resource:
+              - !GetAtt IAMUser.Arn
+
+Outputs:
+  Cluster:
+    Description: A reference to the ECS cluster
+    Value: !Ref ECSCluster
+
+  ECSServiceAutoScalingRole:
+    Description: A reference to ECS service auto scaling role
+    Value: !GetAtt ECSServiceAutoScalingRole.Arn
+
+  ECSAutoScalingGroupName:
+    Description: A reference to ECS AutoScaling Group Name
+    Value: !Ref ECSAutoScalingGroup
